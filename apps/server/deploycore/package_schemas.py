@@ -1,0 +1,94 @@
+from datetime import datetime
+from typing import Annotated, Literal
+from uuid import UUID
+
+from pydantic import Field, StringConstraints, field_validator
+
+from .device_schemas import Wire
+
+Title = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=160, pattern=r"^[^\x00-\x1f\x7f]+$")]
+Description = Annotated[str, StringConstraints(max_length=4000, pattern=r"^[^\x00]*$")]
+Arg = Annotated[str, StringConstraints(max_length=1024, pattern=r"^[^\x00-\x1f\x7f]*$")]
+ExitCode = Annotated[int, Field(strict=True, ge=0, le=2**32 - 1)]
+
+
+class PackageInput(Wire):
+    name: Title
+    publisher: Title
+    description: Description = ""
+
+
+class PackagePatch(Wire):
+    name: Title | None = None
+    publisher: Title | None = None
+    description: Description | None = None
+
+    @field_validator("name", "publisher", "description")
+    @classmethod
+    def reject_explicit_null(cls, value):
+        if value is None:
+            raise ValueError("field cannot be null")
+        return value
+
+
+class MSIProduct(Wire):
+    kind: Literal["msi_product"]
+    product_code: UUID
+
+
+class RegistrySoftware(Wire):
+    kind: Literal["registry_software"]
+    display_name: Title
+    version: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120, pattern=r"^[^\x00-\x1f\x7f]+$")]
+
+
+Detection = Annotated[MSIProduct | RegistrySoftware, Field(discriminator="kind")]
+
+
+class VersionInput(Wire):
+    version: Annotated[str, StringConstraints(strip_whitespace=True, max_length=80, pattern=r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")]
+    architecture: Literal["x64", "x86"]
+    installer: Literal["msi", "exe"]
+    min_windows_build: Annotated[int, Field(strict=True, ge=1, le=2**31 - 1)] | None = None
+    install_args: Annotated[list[Arg], Field(max_length=64)] = Field(default_factory=list)
+    uninstall_args: Annotated[list[Arg], Field(max_length=64)] | None = None
+    detection: Detection
+    timeout_seconds: Annotated[int, Field(strict=True, ge=1, le=86400)] = 1800
+    success_codes: Annotated[list[ExitCode], Field(min_length=1, max_length=32)] = Field(default_factory=lambda: [0, 3010])
+    reboot_required: bool = False
+
+    @field_validator("success_codes")
+    @classmethod
+    def unique_codes(cls, codes):
+        if len(set(codes)) != len(codes):
+            raise ValueError("exit codes must be unique")
+        return codes
+
+
+class PackageView(PackageInput):
+    id: UUID
+    archived_at: datetime | None
+
+
+class ArtifactView(Wire):
+    filename: str
+    size_bytes: int
+    sha256: str
+    signature: Literal["verified", "unverified"]
+    uploaded_at: datetime
+
+
+class VersionView(VersionInput):
+    id: UUID
+    approved_at: datetime | None
+    approved_by: UUID | None
+    artifact: ArtifactView | None
+
+
+class PackagePage(Wire):
+    items: list[PackageView]
+    total: int
+
+
+class PackageDetail(PackageView):
+    versions: list[VersionView]

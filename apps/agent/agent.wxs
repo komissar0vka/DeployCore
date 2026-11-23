@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*" Name="DeployCore Agent" Language="1033" Version="$(var.Version)"
+           Manufacturer="DeployCore" UpgradeCode="43FF5EBB-C2CC-4C78-B438-D7FDF3414341">
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine"/>
+    <MajorUpgrade DowngradeErrorMessage="A newer version of DeployCore Agent is already installed."/>
+    <MediaTemplate EmbedCab="yes"/>
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLDIR" Name="DeployCore Agent">
+          <Component Id="Agent" Guid="94CF3099-453E-4408-B7C1-4DC851B45373" Win64="yes">
+            <File Id="AgentExe" Name="deploycore-agent.exe" Source="$(var.Source)" KeyPath="yes">
+              <Shortcut Id="SetupShortcut" Directory="ProgramMenuFolder"
+                        Name="DeployCore Agent Setup" Advertise="yes" WorkingDirectory="INSTALLDIR"/>
+            </File>
+          </Component>
+        </Directory>
+      </Directory>
+      <Directory Id="ProgramMenuFolder"/>
+    </Directory>
+    <Feature Id="AgentFeature" Title="DeployCore Agent" Level="1">
+      <ComponentRef Id="Agent"/>
+    </Feature>
+  </Product>
+</Wix>

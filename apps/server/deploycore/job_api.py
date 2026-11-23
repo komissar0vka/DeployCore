@@ -1,0 +1,291 @@
+from datetime import timedelta
+from typing import Annotated
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from sqlalchemy import func, select, text
+
+from . import job_schemas as wire
+from .device_api import AgentDevice
+from .device_models import Agent, Device
+from .job_models import DeploymentAttempt as Attempt, DeploymentEvent as Event, DeploymentJob as Job, DeploymentTarget as Target
+from .models import User
+from .package_models import PackageArtifact, SoftwarePackage, SoftwareVersion
+from .package_storage import artifact_path
+from .security import Db, Permission, audit, require
+
+router = APIRouter(prefix="/api/v1")
+Reader = Annotated[User, Depends(require(Permission.READ))]
+Operator = Annotated[User, Depends(require(Permission.MANAGE_OPERATIONS))]
+LEASE = timedelta(seconds=120)
+ACTIVE = ("leased", "running")
+MAX_ATTEMPTS = 5
+
+
+def clock(db: Db):
+    return db.scalar(select(func.clock_timestamp()))
+
+
+def job_row(db: Db, job_id: UUID):
+    row = db.execute(
+        select(Job, SoftwareVersion.version, SoftwarePackage.name)
+        .join(SoftwareVersion, SoftwareVersion.id == Job.version_id)
+        .join(SoftwarePackage, SoftwarePackage.id == SoftwareVersion.package_id)
+        .where(Job.id == job_id)
+    ).one_or_none()
+    if row is None:
+        raise HTTPException(404, "deployment_not_found")
+    return row
+
+
+def counts_for(db: Db, ids: list[UUID]) -> dict:
+    counts: dict = {job_id: {} for job_id in ids}
+    for job_id, state, count in db.execute(
+        select(Target.job_id, Target.state, func.count()).where(Target.job_id.in_(ids))
+        .group_by(Target.job_id, Target.state)
+    ):
+        counts[job_id][state] = count
+    return counts
+
+
+def view(job: Job, version: str, name: str, counts: dict) -> wire.JobView:
+    return wire.JobView(id=job.id, version_id=job.version_id, package_name=name, version=version,
+                        operation=job.operation, created_at=job.created_at, counts=counts)
+
+
+def get_view(db: Db, job_id: UUID) -> wire.JobView:
+    return view(*job_row(db, job_id), counts_for(db, [job_id])[job_id])
+
+
+def event(db: Db, job_id: UUID, action: str, target: Target | None = None, attempt: Attempt | None = None):
+    db.add(Event(job_id=job_id, action=action, target_id=target.id if target else None,
+                 attempt_id=attempt.id if attempt else None))
+
+
+def last_attempt(db: Db, target_id: UUID) -> Attempt | None:
+    return db.scalar(select(Attempt).where(Attempt.target_id == target_id).order_by(Attempt.number.desc()).limit(1))
+
+
+@router.post("/deployments", tags=["Deployments"], status_code=201)
+def create_job(data: wire.JobInput, request: Request, db: Db, actor: Operator) -> wire.JobView:
+    db.execute(text("SELECT pg_advisory_xact_lock(4, hashtext(:key))"),
+               {"key": f"{actor.id}:{data.request_id}"})
+    existing = db.scalar(select(Job).where(Job.created_by == actor.id, Job.request_id == data.request_id))
+    if existing is not None:
+        device_ids = set(db.scalars(select(Target.device_id).where(Target.job_id == existing.id)))
+        if existing.version_id != data.version_id or existing.operation != data.operation or device_ids != set(data.device_ids):
+            raise HTTPException(409, "deployment_request_conflict")
+        result = get_view(db, existing.id)
+        db.commit()
+        return result
+
+    row = db.execute(
+        select(SoftwareVersion, SoftwarePackage).join(SoftwarePackage, SoftwarePackage.id == SoftwareVersion.package_id)
+        .where(SoftwareVersion.id == data.version_id).with_for_update(of=SoftwarePackage)
+    ).one_or_none()
+    artifact = db.get(PackageArtifact, data.version_id)
+    if (row is None or row[1].archived_at is not None or row[0].approved_at is None
+            or artifact is None or artifact.signature != "verified"):
+        raise HTTPException(409, "deployment_version_unavailable")
+    if not artifact_path(data.version_id).is_file():
+        raise HTTPException(503, "package_storage_unavailable")
+    if data.operation == "uninstall" and row[0].uninstall_args is None:
+        raise HTTPException(409, "deployment_uninstall_unavailable")
+    devices = list(db.scalars(
+        select(Device.id).join(Agent, Agent.device_id == Device.id)
+        .where(Device.id.in_(data.device_ids), Device.deleted_at.is_(None), Agent.revoked_at.is_(None))
+    ))
+    if len(devices) != len(data.device_ids):
+        raise HTTPException(422, "deployment_devices_unavailable")
+
+    job = Job(version_id=data.version_id, operation=data.operation, created_by=actor.id, request_id=data.request_id)
+    db.add(job)
+    db.flush()
+    db.add_all(Target(job_id=job.id, device_id=device_id) for device_id in devices)
+    event(db, job.id, "created")
+    audit(db, request, "deployment_created", actor=actor,
+          details={"job_id": str(job.id), "version_id": str(job.version_id), "operation": job.operation,
+                   "target_count": str(len(devices))})
+    result = view(job, row[0].version, row[1].name, {"queued": len(devices)})
+    db.commit()
+    return result
+
+
+@router.get("/deployments", tags=["Deployments"])
+def list_jobs(db: Db, actor: Reader, offset: Annotated[int, Query(ge=0, le=100000)] = 0,
+              limit: Annotated[int, Query(ge=1, le=100)] = 25) -> wire.JobPage:
+    rows = db.execute(
+        select(Job, SoftwareVersion.version, SoftwarePackage.name)
+        .join(SoftwareVersion, SoftwareVersion.id == Job.version_id)
+        .join(SoftwarePackage, SoftwarePackage.id == SoftwareVersion.package_id)
+        .order_by(Job.created_at.desc(), Job.id).offset(offset).limit(limit)
+    ).all()
+    counts = counts_for(db, [row[0].id for row in rows])
+    active_count = db.scalar(select(func.count(func.distinct(Target.job_id))).where(Target.state.in_(("queued", *ACTIVE))))
+    result = wire.JobPage(items=[view(*row, counts[row[0].id]) for row in rows],
+                          total=db.scalar(select(func.count(Job.id))), active=active_count)
+    db.commit()
+    return result
+
+
+@router.get("/deployments/{job_id}", tags=["Deployments"])
+def job_detail(job_id: UUID, db: Db, actor: Reader) -> wire.JobDetail:
+    summary = get_view(db, job_id)
+    now = clock(db)
+    latest = (select(Attempt).where(Attempt.target_id == Target.id).order_by(Attempt.number.desc())
+              .limit(1).correlate(Target).lateral())
+    rows = db.execute(
+        select(Target, Device.hostname, latest.c.number, latest.c.lease_expires_at).select_from(Target)
+        .join(Device, Device.id == Target.device_id).outerjoin(latest, text("true"))
+        .where(Target.job_id == job_id).order_by(Device.hostname, Device.id)
+    )
+    targets = [wire.TargetView(
+        id=target.id, device_id=target.device_id, hostname=name, state=target.state,
+        cancel_requested=target.cancel_requested, attempt=number, lease_expires_at=expires if target.state in ACTIVE else None,
+        recovery_required=target.state == "running" and expires is not None and expires <= now,
+    ) for target, name, number, expires in rows]
+    db.commit()
+    return wire.JobDetail(**summary.model_dump(), targets=targets)
+
+
+@router.get("/deployments/{job_id}/events", tags=["Deployments"])
+def job_events(job_id: UUID, db: Db, actor: Reader, before: Annotated[int, Query(ge=1)] | None = None) -> list[wire.EventView]:
+    job_row(db, job_id)
+    query = select(Event).where(Event.job_id == job_id)
+    if before is not None:
+        query = query.where(Event.id < before)
+    result = [wire.EventView.model_validate(entry) for entry in db.scalars(query.order_by(Event.id.desc()).limit(50))]
+    db.commit()
+    return result
+
+
+@router.post("/deployments/{job_id}/cancel", tags=["Deployments"])
+def cancel_job(job_id: UUID, request: Request, db: Db, actor: Operator) -> wire.JobView:
+    if db.get(Job, job_id, with_for_update=True) is None:
+        raise HTTPException(404, "deployment_not_found")
+    targets = list(db.scalars(select(Target).where(Target.job_id == job_id).order_by(Target.id).with_for_update()))
+    now = clock(db)
+    immediate = requested = 0
+    for target in targets:
+        if target.state in ("queued", "leased"):
+            attempt = last_attempt(db, target.id) if target.state == "leased" else None
+            if attempt is not None:
+                attempt.finished_at, attempt.outcome = now, "cancelled"
+            target.state = "cancelled"
+            event(db, job_id, "cancelled", target, attempt)
+            immediate += 1
+        elif target.state == "running" and not target.cancel_requested:
+            target.cancel_requested = True
+            event(db, job_id, "cancel_requested", target, last_attempt(db, target.id))
+            requested += 1
+    if immediate or requested:
+        audit(db, request, "deployment_cancelled", actor=actor,
+              details={"job_id": str(job_id), "cancelled": str(immediate), "requested": str(requested)})
+    result = get_view(db, job_id)
+    db.commit()
+    return result
+
+
+def assignment(db: Db, target: Target, attempt: Attempt) -> wire.PollReply:
+    job = db.get_one(Job, target.job_id)
+    return wire.PollReply(assignment=wire.Assignment(
+        target_id=target.id, attempt_id=attempt.id, version_id=job.version_id,
+        operation=job.operation, lease_expires_at=attempt.lease_expires_at,
+    ))
+
+
+@router.post("/agent/{device_id}/jobs/poll", tags=["Agent Jobs"])
+def poll(db: Db, device: AgentDevice) -> wire.PollReply:
+    # require_agent serializes requests for this device. The unique partial index is a second line of defense.
+    active = db.scalar(select(Target).where(Target.device_id == device.id, Target.state.in_(ACTIVE)).with_for_update())
+    if active is not None:
+        attempt = last_attempt(db, active.id)
+        if active.state == "running":
+            db.commit()
+            return wire.PollReply(recovery_required=True)
+        now = clock(db)
+        if attempt.lease_expires_at > now:
+            reply = assignment(db, active, attempt)
+            db.commit()
+            return reply
+        attempt.finished_at, attempt.outcome = now, "expired"
+        active.state = "failed" if attempt.number == MAX_ATTEMPTS else "queued"
+        event(db, active.job_id, "delivery_failed" if active.state == "failed" else "lease_expired", active, attempt)
+        db.flush()
+    target = db.scalar(
+        select(Target).join(Job, Job.id == Target.job_id)
+        .where(Target.device_id == device.id, Target.state == "queued")
+        .order_by(Job.created_at, Job.id).limit(1).with_for_update(of=Target)
+    )
+    if target is None:
+        db.commit()
+        return wire.PollReply()
+    previous = last_attempt(db, target.id)
+    now = clock(db)
+    attempt = Attempt(target_id=target.id, number=previous.number + 1 if previous else 1,
+                      leased_at=now, lease_expires_at=now + LEASE)
+    db.add(attempt)
+    target.state = "leased"
+    db.flush()
+    event(db, target.job_id, "leased", target, attempt)
+    reply = assignment(db, target, attempt)
+    db.commit()
+    return reply
+
+
+def attempt_for(db: Db, device: Device, target_id: UUID, attempt_id: UUID) -> tuple[Target, Attempt]:
+    target = db.scalar(select(Target).where(Target.id == target_id, Target.device_id == device.id).with_for_update())
+    if target is None:
+        raise HTTPException(404, "deployment_target_not_found")
+    attempt = db.get(Attempt, attempt_id)
+    if attempt is None or attempt.target_id != target.id:
+        raise HTTPException(409, "deployment_lease_conflict")
+    return target, attempt
+
+
+def renew(db: Db, target: Target, attempt: Attempt, *, ack: bool) -> wire.LeaseReply:
+    now = clock(db)
+    if attempt.finished_at is not None or target.state not in ACTIVE:
+        raise HTTPException(409, "deployment_lease_conflict")
+    if attempt.acknowledged_at is None:
+        if not ack or target.state != "leased" or attempt.lease_expires_at <= now:
+            raise HTTPException(409, "deployment_lease_conflict")
+        attempt.acknowledged_at = now
+        target.state = "running"
+        event(db, target.job_id, "acknowledged", target, attempt)
+    elif target.state != "running":
+        raise HTTPException(409, "deployment_lease_conflict")
+    elif attempt.lease_expires_at <= now:
+        event(db, target.job_id, "recovered", target, attempt)
+    attempt.lease_expires_at = now + LEASE
+    result = wire.LeaseReply(lease_expires_at=attempt.lease_expires_at, cancel_requested=target.cancel_requested)
+    db.commit()
+    return result
+
+
+@router.post("/agent/{device_id}/jobs/{target_id}/ack", tags=["Agent Jobs"])
+def acknowledge(target_id: UUID, data: wire.Lease, db: Db, device: AgentDevice) -> wire.LeaseReply:
+    return renew(db, *attempt_for(db, device, target_id, data.attempt_id), ack=True)
+
+
+@router.post("/agent/{device_id}/jobs/{target_id}/heartbeat", tags=["Agent Jobs"])
+def heartbeat(target_id: UUID, data: wire.Lease, db: Db, device: AgentDevice) -> wire.LeaseReply:
+    return renew(db, *attempt_for(db, device, target_id, data.attempt_id), ack=False)
+
+
+@router.post("/agent/{device_id}/jobs/{target_id}/result", tags=["Agent Jobs"])
+def submit_result(target_id: UUID, data: wire.Result, db: Db, device: AgentDevice) -> wire.Result:
+    target, attempt = attempt_for(db, device, target_id, data.attempt_id)
+    if attempt.finished_at is not None:
+        if attempt.acknowledged_at is None or attempt.outcome != data.outcome:
+            raise HTTPException(409, "deployment_result_conflict")
+    else:
+        if attempt.acknowledged_at is None or target.state != "running":
+            raise HTTPException(409, "deployment_lease_conflict")
+        if data.outcome == "cancelled" and not target.cancel_requested:
+            raise HTTPException(409, "deployment_cancel_not_requested")
+        attempt.outcome, attempt.finished_at = data.outcome, clock(db)
+        target.state = data.outcome
+        event(db, target.job_id, data.outcome, target, attempt)
+    db.commit()
+    return data

@@ -1,0 +1,25 @@
+FROM golang:1.25-bookworm AS agent
+RUN apt-get update && apt-get install -y --no-install-recommends wixl \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY apps/agent/go.mod apps/agent/go.sum ./
+RUN go mod download
+COPY apps/agent/*.go apps/agent/VERSION apps/agent/build.sh apps/agent/setup.ps1 apps/agent/agent.wxs ./
+RUN ./build.sh /out
+
+FROM node:22-alpine AS build
+WORKDIR /app
+COPY apps/web/package.json apps/web/package-lock.json ./
+RUN npm ci
+COPY apps/web/index.html apps/web/tsconfig.json apps/web/vite.config.ts ./
+COPY apps/web/src ./src
+RUN npm run build
+
+FROM nginx:stable-alpine
+COPY deploy/nginx/default.conf /etc/nginx/conf.d/default.conf
+COPY deploy/nginx/api.conf /etc/nginx/deploycore-api.conf
+COPY --from=build /app/dist /usr/share/nginx/html
+COPY --from=build /app/node_modules/swagger-ui-dist/swagger-ui-bundle.js \
+    /app/node_modules/swagger-ui-dist/swagger-ui.css \
+    /app/node_modules/swagger-ui-dist/favicon-32x32.png /usr/share/nginx/html/assets/swagger/
+COPY --from=agent /out/ /usr/share/nginx/html/assets/agent/

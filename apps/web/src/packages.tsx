@@ -1,0 +1,261 @@
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { Package, Plus } from 'lucide-react'
+import { useEffect, useState, type FormEvent } from 'react'
+import { api, type Session } from './api'
+import { Dialog } from './components/ui/dialog'
+import { ConfirmDialog, EmptyState, LoadingSkeleton, SectionTitle, StatusBadge } from './design'
+import { Action, Field, FormError, Panel, errorMessage, type Translate } from './ui'
+
+interface ProductFields { name: string; publisher: string; description: string }
+interface Product extends ProductFields { id: string }
+interface Artifact { filename: string; size_bytes: number; sha256: string; signature: 'verified' | 'unverified' }
+type Detection = { kind: 'msi_product'; product_code: string } | { kind: 'registry_software'; display_name: string; version: string }
+interface VersionInput {
+  version: string
+  architecture: 'x64' | 'x86'
+  installer: 'msi' | 'exe'
+  min_windows_build: number | null
+  install_args: string[]
+  uninstall_args: string[] | null
+  detection: Detection
+  timeout_seconds: number
+  success_codes: number[]
+  reboot_required: boolean
+}
+interface Version extends VersionInput { id: string; approved_at: string | null; artifact: Artifact | null }
+interface Props { session: Session; t: Translate }
+const pageSize = 25
+
+function ProductDialog({ product, close, save, pending, error, t }: {
+  product?: Product; close: () => void; save: (body: ProductFields) => void; pending: boolean; error: unknown; t: Translate
+}) {
+  function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const data = new FormData(event.currentTarget)
+    save({ name: String(data.get('name')), publisher: String(data.get('publisher')), description: String(data.get('description')) })
+  }
+  return <Dialog title={product ? t('Редактировать программу', 'Edit program') : t('Новая программа', 'New program')}
+    close={close} closeLabel={t('Закрыть', 'Close')}>
+    <form className="grid gap-3" onSubmit={submit}>
+      <Field name="name" label={t('Название', 'Name')} maxLength={160} required defaultValue={product?.name} />
+      <Field name="publisher" label={t('Издатель', 'Publisher')} maxLength={160} required defaultValue={product?.publisher} />
+      <label className="grid gap-2 text-sm">{t('Описание', 'Description')}
+        <textarea className="input min-h-20" name="description" maxLength={4000} defaultValue={product?.description} />
+      </label>
+      <FormError message={error ? errorMessage(error, t) : null} />
+      <Action type="submit" disabled={pending}>{t('Сохранить', 'Save')}</Action>
+    </form>
+  </Dialog>
+}
+
+function VersionDialog({ t, close, save, pending, error }: {
+  t: Translate; close: () => void; save: (body: VersionInput) => void; pending: boolean; error: unknown
+}) {
+  const [detection, setDetection] = useState<Detection['kind']>('registry_software')
+  function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const fields = new FormData(event.currentTarget)
+    const read = (name: string) => String(fields.get(name) ?? '').trim()
+    const lines = (name: string) => read(name).split(/\r?\n/).map(line => line.trim()).filter(Boolean)
+    save({
+      version: read('version'), architecture: read('architecture') as VersionInput['architecture'],
+      installer: read('installer') as VersionInput['installer'],
+      min_windows_build: read('build') ? Number(read('build')) : null,
+      install_args: lines('install'), uninstall_args: fields.get('remove') ? lines('uninstall') : null,
+      timeout_seconds: Number(read('timeout')), success_codes: read('codes').split(',').map(value => Number(value.trim())),
+      reboot_required: fields.has('reboot'),
+      detection: detection === 'msi_product' ? { kind: detection, product_code: read('productCode') }
+        : { kind: detection, display_name: read('display'), version: read('detectedVersion') },
+    })
+  }
+  return <Dialog title={t('Новая версия', 'New version')} close={close} closeLabel={t('Закрыть', 'Close')}>
+    <form className="grid gap-3" onSubmit={submit}>
+      <div className="grid gap-3 sm:grid-cols-3">
+        <Field name="version" label={t('Версия', 'Version')} required maxLength={80} />
+        <label className="grid gap-2 text-sm">{t('Тип', 'Type')}<select className="input" name="installer" aria-label={t('Тип', 'Type')}><option value="msi">MSI</option><option value="exe">EXE</option></select></label>
+        <label className="grid gap-2 text-sm">{t('Архитектура', 'Architecture')}<select className="input" name="architecture" aria-label={t('Архитектура', 'Architecture')}><option>x64</option><option>x86</option></select></label>
+      </div>
+      <div className="grid gap-3 sm:grid-cols-2">
+        <Field name="build" label={t('Мин. сборка Windows', 'Min. Windows build')} type="number" min={1} max={2147483647} />
+        <Field name="timeout" label={t('Таймаут, с', 'Timeout, s')} type="number" min={1} max={86400} required defaultValue={1800} />
+      </div>
+      <Field name="codes" label={t('Допустимые коды через запятую', 'Accepted exit codes, comma-separated')}
+        pattern="[0-9]+(, *[0-9]+)*" required defaultValue="0, 3010" />
+      <label className="grid gap-2 text-sm">{t('Аргументы установки, по одному в строке', 'Installation arguments, one per line')}
+        <textarea className="input" name="install" maxLength={12000} />
+      </label>
+      <label className="grid gap-2 text-sm">{t('Аргументы удаления, по одному в строке', 'Removal arguments, one per line')}
+        <textarea className="input" name="uninstall" maxLength={12000} />
+      </label>
+      <label className="text-sm"><input name="remove" type="checkbox" /> {t('Разрешить удаление', 'Allow removal')}</label>
+      <label className="text-sm"><input name="reboot" type="checkbox" /> {t('Требуется перезагрузка', 'Restart required')}</label>
+      <label className="grid gap-2 text-sm">{t('Правило обнаружения', 'Detection rule')}
+        <select className="input" aria-label={t('Правило обнаружения', 'Detection rule')} value={detection} onChange={event => setDetection(event.target.value as Detection['kind'])}>
+          <option value="registry_software">{t('Имя и версия в реестре', 'Registry name and version')}</option>
+          <option value="msi_product">MSI ProductCode</option>
+        </select>
+      </label>
+      {detection === 'msi_product' ? <Field name="productCode" label="MSI ProductCode" required maxLength={38} />
+        : <div className="grid gap-3 sm:grid-cols-2">
+          <Field name="display" label={t('Имя в реестре', 'Registry display name')} required maxLength={160} />
+          <Field name="detectedVersion" label={t('Версия в реестре', 'Registry version')} required maxLength={120} />
+        </div>}
+      <FormError message={error ? errorMessage(error, t) : null} />
+      <Action type="submit" disabled={pending}>{t('Добавить версию', 'Add version')}</Action>
+    </form>
+  </Dialog>
+}
+
+function UploadForm({ path, installer, csrf, t, uploaded }: {
+  path: string; installer: string; csrf: string; t: Translate; uploaded: () => void
+}) {
+  const [controller, setController] = useState<AbortController | null>(null)
+  const [problem, setProblem] = useState('')
+  useEffect(() => () => controller?.abort(), [controller])
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const selected = new FormData(event.currentTarget).get('file')
+    if (!(selected instanceof File) || !selected.size) return
+    const active = new AbortController()
+    setController(active)
+    setProblem('')
+    try {
+      await api<Artifact>(`${path}?${new URLSearchParams({ filename: selected.name })}`, {
+        method: 'PUT', body: selected, csrf, signal: active.signal,
+      })
+      uploaded()
+    } catch (error) {
+      if (!active.signal.aborted) setProblem(errorMessage(error, t))
+    } finally {
+      setController(null)
+    }
+  }
+  return <form className="grid gap-2" onSubmit={submit}>
+    <Field type="file" name="file" accept={'.' + installer} label={t('Установщик', 'Installer')} required disabled={!!controller} />
+    <div className="flex flex-wrap gap-2">
+      <Action type="submit" disabled={!!controller}>{t('Загрузить и проверить', 'Upload and verify')}</Action>
+      {controller && <Action secondary onClick={() => controller.abort()}>{t('Отменить загрузку', 'Cancel upload')}</Action>}
+    </div>
+    {controller && <p role="status" className="text-sm text-muted-foreground">{t('Загрузка и проверка подписи…', 'Uploading and verifying signature…')}</p>}
+    <FormError message={problem} />
+  </form>
+}
+
+function ProductDetails({ id, back, session, t }: Props & { id: string; back: () => void }) {
+  const client = useQueryClient()
+  const path = '/packages/' + id
+  const query = useQuery({ queryKey: ['package', id], queryFn: () => api<Product & { versions: Version[] }>(path) })
+  const [modal, setModal] = useState<'edit' | 'version' | 'archive' | null>(null)
+  const writable = session.user.role !== 'viewer'
+  const csrf = session.csrf_token
+  function updated() {
+    void client.invalidateQueries({ queryKey: ['package', id] })
+    void client.invalidateQueries({ queryKey: ['packages'] })
+  }
+  const edit = useMutation({ mutationFn: (body: ProductFields) => api<Product>(path, { method: 'PATCH', body, csrf }),
+    onSuccess: () => { updated(); setModal(null) } })
+  const add = useMutation({ mutationFn: (body: VersionInput) => api<Version>(path + '/versions', { method: 'POST', body, csrf }),
+    onSuccess: () => { updated(); setModal(null) } })
+  const archive = useMutation({ mutationFn: () => api<void>(path, { method: 'DELETE', csrf }),
+    onSuccess: () => { void client.invalidateQueries({ queryKey: ['packages'] }); back() } })
+  const approval = useMutation({ mutationFn: (version: string) => api<Version>(`${path}/versions/${version}/approve`, { method: 'POST', csrf }),
+    onSuccess: updated })
+  const product = query.data
+
+  return <div className="grid gap-4">
+    <Action secondary onClick={back}>{t('К каталогу', 'Back to catalog')}</Action>
+    {query.isPending && <LoadingSkeleton label={t('Загрузка программы', 'Loading program')} />}
+    <FormError message={(query.error || archive.error || approval.error) && errorMessage(query.error || archive.error || approval.error, t)} />
+    {product && <Panel>
+      <SectionTitle title={product.name} description={product.publisher} actions={writable && <div className="flex flex-wrap gap-2">
+        <Action secondary onClick={() => { edit.reset(); setModal('edit') }}>{t('Редактировать', 'Edit')}</Action>
+        <Action secondary onClick={() => setModal('archive')} disabled={archive.isPending}>{t('Архивировать', 'Archive')}</Action>
+        <Action onClick={() => { add.reset(); setModal('version') }}>{t('Новая версия', 'New version')}</Action>
+      </div>} />
+      {product.description && <p className="mb-3 break-words text-sm text-muted-foreground">{product.description}</p>}
+      {!product.versions.length && <EmptyState title={t('Версий пока нет', 'No versions yet')} />}
+      <div className="grid gap-3">
+        {product.versions.map(version => {
+          const artifactPath = `${path}/versions/${version.id}/artifact`
+          return <details key={version.id} className="rounded-xl border border-border px-3 py-2.5">
+            <summary className="cursor-pointer text-sm"><strong>{version.version}</strong> · {version.installer.toUpperCase()} {version.architecture}
+              <span className="ml-2"><StatusBadge tone={version.approved_at ? 'success' : 'neutral'}>
+                {version.approved_at ? t('Утверждена', 'Approved') : t('Черновик', 'Draft')}
+              </StatusBadge></span>
+            </summary>
+            <div className="mt-3 grid min-w-0 gap-3">
+              <dl className="grid gap-1 text-sm text-muted-foreground sm:grid-cols-[auto_1fr] sm:gap-x-4">
+                <dt>{t('Минимальная сборка Windows', 'Minimum Windows build')}</dt><dd>{version.min_windows_build ?? '—'}</dd>
+                <dt>{t('Таймаут и коды завершения', 'Timeout and exit codes')}</dt><dd>{version.timeout_seconds} s · {version.success_codes.join(', ')}</dd>
+                <dt>{t('Перезагрузка', 'Restart')}</dt><dd>{version.reboot_required ? t('Требуется', 'Required') : t('По результату', 'Based on result')}</dd>
+                <dt>{t('Обнаружение', 'Detection')}</dt><dd className="break-all">{version.detection.kind === 'msi_product'
+                  ? version.detection.product_code : `${version.detection.display_name} · ${version.detection.version}`}</dd>
+                <dt>{t('Аргументы установки', 'Installation arguments')}</dt><dd className="break-all font-mono">{JSON.stringify(version.install_args)}</dd>
+                <dt>{t('Аргументы удаления', 'Removal arguments')}</dt><dd className="break-all font-mono">{version.uninstall_args === null ? '—' : JSON.stringify(version.uninstall_args)}</dd>
+              </dl>
+              {version.artifact ? <div className="grid gap-2 text-sm">
+                <span className="break-all">{version.artifact.filename} · {(version.artifact.size_bytes / 1048576).toFixed(2)} MiB</span>
+                <code className="break-all text-xs">SHA-256 {version.artifact.sha256}</code>
+                <div><StatusBadge tone={version.artifact.signature === 'verified' ? 'success' : 'warning'}>
+                  {version.artifact.signature === 'verified' ? t('Authenticode проверен', 'Authenticode verified') : t('Подпись не подтверждена', 'Signature unverified')}
+                </StatusBadge></div>
+                {writable && <div className="flex flex-wrap items-center gap-3">
+                  <a className="text-primary hover:underline" href={'/api/v1' + artifactPath} download>{t('Скачать установщик', 'Download installer')}</a>
+                  {!version.approved_at && version.artifact.signature === 'verified' &&
+                    <Action disabled={approval.isPending} onClick={() => approval.mutate(version.id)}>{t('Утвердить версию', 'Approve version')}</Action>}
+                </div>}
+              </div> : writable ? <UploadForm path={artifactPath} installer={version.installer} csrf={csrf} t={t} uploaded={updated} />
+                : <EmptyState title={t('Установщик ещё не загружен', 'No installer uploaded yet')} />}
+            </div>
+          </details>
+        })}
+      </div>
+    </Panel>}
+    {modal === 'edit' && product && <ProductDialog product={product} t={t} close={() => setModal(null)}
+      save={body => edit.mutate(body)} pending={edit.isPending} error={edit.error} />}
+    {modal === 'version' && <VersionDialog t={t} close={() => setModal(null)}
+      save={body => add.mutate(body)} pending={add.isPending} error={add.error} />}
+    {modal === 'archive' && <ConfirmDialog title={t('Архивировать программу?', 'Archive program?')}
+      description={t('Программа исчезнет из каталога. Версии и установщики сохранятся.', 'The program is hidden. Versions and files are retained.')}
+      labels={{ close: t('Закрыть', 'Close'), cancel: t('Отмена', 'Cancel'), confirm: t('Архивировать', 'Archive') }}
+      close={() => setModal(null)} confirm={() => { setModal(null); archive.mutate() }} />}
+  </div>
+}
+
+export function PackageCatalog({ session, t }: Props) {
+  const client = useQueryClient()
+  const [selected, setSelected] = useState<string>()
+  const [search, setSearch] = useState('')
+  const [term, setTerm] = useState('')
+  const [offset, setOffset] = useState(0)
+  const [open, setOpen] = useState(false)
+  const query = useQuery({
+    queryKey: ['packages', term, offset], enabled: !selected,
+    queryFn: () => api<{ items: Product[]; total: number }>(`/packages?${new URLSearchParams({ q: term, offset: String(offset), limit: String(pageSize) })}`),
+  })
+  const create = useMutation({
+    mutationFn: (body: ProductFields) => api<Product>('/packages', { method: 'POST', body, csrf: session.csrf_token }),
+    onSuccess: record => { setOpen(false); setSelected(record.id); void client.invalidateQueries({ queryKey: ['packages'] }) },
+  })
+  if (selected) return <ProductDetails id={selected} back={() => setSelected(undefined)} session={session} t={t} />
+  return <Panel>
+    <SectionTitle title={t('Каталог программ', 'Software catalog')} actions={session.user.role !== 'viewer' &&
+      <Action onClick={() => { create.reset(); setOpen(true) }}><Plus className="size-4" aria-hidden />{t('Новая программа', 'New program')}</Action>} />
+    <form className="mb-4 flex flex-wrap items-end gap-2" onSubmit={event => { event.preventDefault(); setTerm(search.trim()); setOffset(0) }}>
+      <Field label={t('Название или издатель', 'Name or publisher')} value={search} maxLength={160} onChange={event => setSearch(event.target.value)} />
+      <Action secondary type="submit">{t('Поиск', 'Search')}</Action>
+    </form>
+    {query.isPending && <LoadingSkeleton label={t('Загрузка каталога', 'Loading catalog')} />}
+    <FormError message={query.error && errorMessage(query.error, t)} />
+    {query.data?.items.length === 0 && <EmptyState icon={Package} title={term ? t('Ничего не найдено', 'No results') : t('Программ пока нет', 'No programs yet')} />}
+    {!!query.data?.items.length && <ul className="divide-y divide-border">{query.data.items.map(item => <li key={item.id} className="py-3">
+      <button className="break-all text-left font-medium text-primary hover:underline" onClick={() => setSelected(item.id)} type="button">{item.name}</button>
+      <p className="break-words text-sm text-muted-foreground">{item.publisher}</p>
+    </li>)}</ul>}
+    {(offset > 0 || (query.data?.total ?? 0) > pageSize) && <div className="mt-4 flex flex-wrap gap-2">
+      <Action secondary disabled={!offset} onClick={() => setOffset(offset - pageSize)}>{t('Предыдущая', 'Previous')}</Action>
+      <Action secondary disabled={offset + pageSize >= (query.data?.total ?? 0)} onClick={() => setOffset(offset + pageSize)}>{t('Следующая', 'Next')}</Action>
+    </div>}
+    {open && <ProductDialog t={t} close={() => setOpen(false)} save={body => create.mutate(body)} pending={create.isPending} error={create.error} />}
+  </Panel>
+}

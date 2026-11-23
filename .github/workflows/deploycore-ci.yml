@@ -1,0 +1,38 @@
+name: DeployCore CI
+
+on:
+  push:
+    paths:
+      - 'apps/**'
+      - 'packages/**'
+      - 'deploy/**'
+      - '.github/workflows/deploycore-ci.yml'
+  pull_request:
+    paths:
+      - 'apps/**'
+      - 'packages/**'
+      - 'deploy/**'
+      - '.github/workflows/deploycore-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  infrastructure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: 'apps/server/requirements*.txt'
+      - name: Test FastAPI
+        working-directory: apps/server
+        run: |
+          python -m pip install -r requirements-test.txt
+          python -m pytest -q
+      - name: Build and test PostgreSQL, FastAPI, React and Nginx over HTTPS
+        run: deploy/scripts/smoke.sh

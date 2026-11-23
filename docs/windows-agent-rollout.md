@@ -1,0 +1,41 @@
+# Развёртывание DeployCore Agent через GPO
+
+1. Выберите пилотное OU. Убедитесь, что компьютеры находят DNS-имя DeployCore и могут подключиться к HTTPS-порту. Раздайте доверенный корпоративный корневой сертификат через Computer Configuration → Policies → Windows Settings → Security Settings → Public Key Policies → Trusted Root Certification Authorities, если CA не общедоступный.
+2. Поместите проверенный `deploycore-agent.msi` в доступный компьютерным учётным записям каталог SMB. Назначьте пакет компьютерам через Computer Configuration → Policies → Software Settings → Software Installation, указав UNC-путь. MSI одинаков для всех машин и не содержит регистрационных секретов.
+3. Настройте отдельный сценарий запуска компьютера под LocalSystem. Если установка пакета и сценарий идут одновременно, запускайте сценарий повторно при следующей загрузке, когда MSI уже установлен. Используйте настройку ожидания сети при запуске, если она нужна для доступа к SMB.
+4. Для пилота выдайте отдельный короткоживущий токен с квотой 1 для каждой машины. Храните файлы токенов на выделенном защищённом SMB-ресурсе с шифрованием. На конкретный файл выдайте право чтения его компьютерной учётной записи и администраторам развёртывания, исключите общее чтение. Проверьте и права ресурса, и NTFS ACL. Используйте отдельный каталог от общих файлов MSI и SYSVOL. После подтверждения регистрации удалите файлы с сервера и отзовите неиспользованные токены. Сам сценарий не содержит токенов.
+
+Пример сценария запуска Windows PowerShell 5.1. Замените HTTPS-адрес и UNC-путь на свои.
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$server = 'https://deploycore.example:8443'
+$exe = Join-Path $env:ProgramFiles 'DeployCore Agent\deploycore-agent.exe'
+$tokenFile = Join-Path '\\fileserver\DeployCoreSecrets$' ($env:COMPUTERNAME + '.txt')
+if (Get-Service DeployCoreAgent -ErrorAction SilentlyContinue) { exit 0 }
+if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { exit 1 }
+try {
+    $secret = [IO.File]::ReadAllText($tokenFile).Trim()
+    if ($secret -cnotmatch '^[A-Za-z0-9_-]{43}$') { exit 1 }
+    $secret | & $exe install --server $server
+    if ($LASTEXITCODE -ne 0) { exit 1 }
+} catch {
+    Write-Error 'DeployCore enrollment provisioning failed. Check the deployment configuration.'
+    exit 1
+} finally {
+    $secret = $null
+}
+```
+
+Проверяйте результат в «Компьютерах». Наличие службы подтверждает только её установку. Если токен истёк и устройство не появилось, выдайте новый и передайте машине через `recover` по тому же защищённому каналу. Если устройство раньше было зарегистрировано, используйте привязанный токен восстановления.
+
+## Приёмка на Windows
+
+- На чистой Windows x64 скачайте EXE и MSI, проверьте SHA-256. Дважды щёлкните EXE и подтвердите UAC. Убедитесь, что открывается мастер. Установите MSI и повторите проверку с ярлыком меню «Пуск».
+- Введите адрес с корректным TLS. Проверьте кнопкой **Проверить HTTPS**. Повторите с недоступным портом, недоверенным CA и адресом, отсутствующим в SAN. Каждый неверный адрес должен дать ошибку, а попытка установки с ним не должна создать службу.
+- Выдайте токен на одну регистрацию. Введите его в мастер. Убедитесь, что установка недоступна без согласия, примите соглашение и установите службу и выполните `Get-Service DeployCoreAgent`. В панели дождитесь компьютера со статусом «Онлайн» и версией 0.3.3. Проверьте модель, CPU, RAM, диски, сетевые интерфейсы и список программ. Проверьте, что второй компьютер с тем же исчерпанным токеном не зарегистрируется.
+- Выполните `Restart-Service DeployCoreAgent` и убедитесь, что существующий компьютер продолжает слать heartbeat с тем же UUID. Проверяйте события Windows в `Get-WinEvent -FilterHashtable @{LogName='Application'; ProviderName='DeployCoreAgent'} -MaxEvents 20`. Сравните с событиями в панели и убедитесь, что в журнале нет токена.
+- Повторите на доменной машине пилотного OU после применения GPO. Проверьте TLS из контекста LocalSystem, доменное имя в карточке и отсутствие повторной регистрации после второй загрузки.
+- Выполните `deploycore-agent.exe uninstall` из повышенного PowerShell, затем удалите MSI. Проверьте отсутствие службы и ярлыка. Локальное состояние DPAPI сохраняется для переустановки. При снятии с управления дополнительно отзовите ключ устройства в панели.
+
+[Назначение MSI через GPO](https://learn.microsoft.com/en-us/troubleshoot/windows-server/group-policy/use-group-policy-to-install-software) · [Развёртывание доверенного сертификата](https://learn.microsoft.com/en-us/windows-server/identity/ad-cs/distribute-certificates-group-policy)

@@ -1,0 +1,79 @@
+name: DeployCore Windows Agent
+on:
+  push:
+    paths: ['apps/agent/**', '.github/workflows/deploycore-agent.yml']
+    tags: ['v*']
+  pull_request:
+    paths: ['apps/agent/**', '.github/workflows/deploycore-agent.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: apps/agent
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: apps/agent/go.mod
+          cache-dependency-path: apps/agent/go.sum
+      - run: go test -race ./...
+      - run: go vet ./...
+      - run: GOOS=windows GOARCH=amd64 go vet ./...
+      - run: sudo apt-get update && sudo apt-get install -y wixl
+      - run: ./build.sh dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deploycore-agent-windows-amd64
+          path: apps/agent/dist/
+          if-no-files-found: error
+  windows:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    needs: agent
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: apps/agent/go.mod
+          cache-dependency-path: apps/agent/go.sum
+      - run: go test ./...
+        working-directory: apps/agent
+      - name: Validate Windows PowerShell wizard syntax
+        shell: powershell
+        run: |
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path (Get-Location) 'apps/agent/setup.ps1'), [ref]$tokens, [ref]$errors)
+          if ($errors.Count) { throw ($errors -join "`n") }
+      - uses: actions/download-artifact@v4
+        with:
+          name: deploycore-agent-windows-amd64
+          path: agent-artifact
+      - name: Exercise MSI lifecycle on Windows
+        shell: pwsh
+        working-directory: agent-artifact
+        run: |
+          $msi = Join-Path (Get-Location) 'deploycore-agent.msi'
+          $result = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru
+          if ($result.ExitCode -ne 0) { throw "MSI install failed: $($result.ExitCode)" }
+          $agent = Join-Path $env:ProgramFiles 'DeployCore Agent/deploycore-agent.exe'
+          if ((& $agent version) -ne (Get-Content ../apps/agent/VERSION)) { throw 'Incorrect packaged agent version' }
+          & $agent check --server https://127.0.0.1:1
+          if ($LASTEXITCODE -eq 0) { throw 'An unavailable endpoint passed the readiness check' }
+          $env:DEPLOYCORE_TEST_PACKAGED_AGENT = $agent
+          Push-Location ../apps/agent
+          try {
+            go test -run '^TestPackagedAgentService$' -count=1 -timeout 4m
+            if ($LASTEXITCODE -ne 0) { throw 'Windows service integration failed' }
+          } finally {
+            Pop-Location
+          }
+          $result = Start-Process msiexec.exe -ArgumentList "/x `"$msi`" /qn /norestart" -Wait -PassThru
+          if ($result.ExitCode -ne 0 -or (Test-Path $agent)) { throw 'MSI uninstall failed' }
